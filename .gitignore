@@ -1,0 +1,5 @@
+emqx-plugin/_build/
+emqx-plugin/ebin/*.beam
+*.pyc
+__pycache__/
+.DS_Store
