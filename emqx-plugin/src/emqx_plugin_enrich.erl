@@ -6,8 +6,8 @@
 -behaviour(gen_server).
 
 -export([start/2, stop/1]).
--export([load/1, unload/1]).
--export([on_message_publish/2]).
+-export([on_message_publish/1]).
+-export([do_lookup/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 -export([start_link/0]).
@@ -46,36 +46,52 @@
 %%   max_concurrent_loads    8
 %%   hook_priority           100
 
+%% start/2 MUST return {ok, Pid} (or {ok, Pid, State}) — the OTP
+%% application contract. A bare `ok` makes application:start/1 treat the
+%% start as failed, roll it back, and tear down the application master —
+%% which also destroys any ETS table created here. The loader gen_server
+%% is our long-lived root process, so we return its pid and let it own
+%% the cache table (created in its init/1). That keeps the table alive
+%% for the lifetime of the plugin.
 start(_StartType, _Args) ->
-    ok = ensure_cache(),
-    {ok, _} = start_link(),
-    ok.
+    io:format("emqx_plugin_enrich: starting~n"),
+    {ok, LoaderPid} = start_link(),
+    ok = emqx_hooks:add('message.publish',
+                        {?MODULE, on_message_publish, []},
+                        ?HP_HIGHEST),
+    io:format("emqx_plugin_enrich: hook registered~n"),
+    {ok, LoaderPid}.
 
 stop(_State) ->
-    ok.
-
-%%====================================================================
-%% EMQX plugin lifecycle
-%%====================================================================
-
-load(_Env) ->
-    ok = emqx_hook:add('message.publish',
-                       {?MODULE, on_message_publish, []},
-                       ?HP_HIGHEST),
-    ok.
-
-unload(_Env) ->
-    ok = emqx_hook:del('message.publish',
-                       {?MODULE, on_message_publish, []}),
+    ok = emqx_hooks:del('message.publish',
+                        {?MODULE, on_message_publish, []}),
     ok.
 
 %%====================================================================
 %% Hook: message.publish
 %%====================================================================
 
-on_message_publish(Msg = #{topic := Topic, payload := Payload}, _Args) ->
+%% EMQX passes the message as an #message{} record (defined in
+%% emqx/include/emqx.hrl), NOT a map. The POC compiles this single file
+%% against stock Erlang/OTP without EMQX's headers, so we don't -include
+%% that record. Instead we read fields through the stable emqx_message
+%% API (topic/1, payload/1) and write the enriched payload back by its
+%% record position.
+%%
+%% Record layout (emqx 5.8):
+%%   {message, Id, QoS, From, Flags, Headers, Topic, Payload, Timestamp, Extra}
+%% so Payload is tuple element 8.
+%%
+%% PROD-DEV (record coupling): positional setelement/3 is brittle across
+%% EMQX versions. For product, add emqx as a build-time dependency and
+%% -include_lib("emqx/include/emqx.hrl") so you can pattern-match
+%% #message{topic=T, payload=P} and update with Msg#message{payload=NP}.
+-define(MSG_PAYLOAD_POS, 8).
+
+on_message_publish(Msg) ->
+    Topic = emqx_message:topic(Msg),
     case emqx_topic:match(Topic, ?TOPIC_FILTER) of
-        true  -> do_enrich(Msg, Payload);
+        true  -> do_enrich(Msg, emqx_message:payload(Msg));
         false -> {ok, Msg}
     end.
 
@@ -91,7 +107,12 @@ do_enrich(Msg, Payload) ->
                                [Class, Reason]),
                 {ok, Msg}
         end,
-    logger:info("emqx_plugin_enrich hook_us=~p",
+    %% Logged at `warning` level on purpose: EMQX's default console/file
+    %% log level is `warning`, and the GUIDE relies on `grep hook_us` from
+    %% `docker compose logs emqx`. At info/notice these lines are filtered
+    %% out by default. (PROD-DEV: demote to info and raise the broker log
+    %% level, or expose via a metric, for production.)
+    logger:warning("emqx_plugin_enrich hook_us=~p",
                 [erlang:monotonic_time(microsecond) - T0]),
     Result.
 
@@ -100,7 +121,8 @@ enrich(Msg, _Decoded, undefined) ->
 enrich(Msg, Decoded, DeviceId) when is_binary(DeviceId) ->
     case cache_lookup(DeviceId) of
         {known, Fields} ->
-            {ok, Msg#{payload := encode(maps:merge(Decoded, Fields))}};
+            NewPayload = encode(maps:merge(Decoded, Fields)),
+            {ok, set_payload(Msg, NewPayload)};
         _ ->
             %% cold | unknown | in_flight — async (non-blocking)
             async_lookup(DeviceId),
@@ -108,6 +130,9 @@ enrich(Msg, Decoded, DeviceId) when is_binary(DeviceId) ->
     end;
 enrich(Msg, _Decoded, _) ->
     {ok, Msg}.
+
+set_payload(Msg, NewPayload) ->
+    erlang:setelement(?MSG_PAYLOAD_POS, Msg, NewPayload).
 
 %%====================================================================
 %% Cache (ETS-backed, microsecond reads)
@@ -132,8 +157,6 @@ enrich(Msg, _Decoded, _) ->
 %%      wrong at scale; documented in DESIGN.md.
 %%
 %% For product, default to (a) unless a good reason forces (b) or (c).
-
-ensure_cache() ->
 
 ensure_cache() ->
     case ets:info(?CACHE_TABLE) of
@@ -203,8 +226,6 @@ encode(M) when is_map(M) ->
 %% that way: the loader must remain the only place that does HTTP work.
 
 start_link() ->
-
-start_link() ->
     gen_server:start_link({local, ?LOADER}, ?MODULE, [], []).
 
 async_lookup(DeviceId) ->
@@ -212,6 +233,10 @@ async_lookup(DeviceId) ->
 
 %% gen_server callbacks
 init([]) ->
+    %% The loader is the long-lived owner of the cache table. Creating it
+    %% here (rather than in start/2's transient app-master process) ties
+    %% the table's lifetime to this gen_server.
+    ok = ensure_cache(),
     {ok, #{in_flight => sets:new()}}.
 
 handle_call(_, _, S) ->
@@ -276,11 +301,11 @@ code_change(_, S, _) ->
 %% maintained, slightly higher overhead). Stick with `httpc` if portability
 %% across EMQX minor versions matters more than ~200 µs per call.
 %%
-%% PROD-DEV (return semantics from hook): `register_amqp/0` returns
-%% {ok, Msg}; anything else leaves the original message published
-%% untouched (this is how a blip is expressed). Don't return `{stop,
-%%, _}` for blips — that would cause the message.publish path to fail
-%% rather than pass through.
+%% PROD-DEV (return semantics from hook): always return `{ok, Msg}` —
+%% the original (unmodified) `Msg` for blips, or the modified `Msg` for
+%% enrichment. Anything else leaves the published message untouched,
+%% which is exactly how a blip is expressed. Don't return `{stop, _}`
+%% for blips — that fails the publish rather than passing through.
 
 do_lookup(Dev, Parent) ->
     Url = <<?REGISTRY_URL_PREFIX/binary, Dev/binary>>,

@@ -6,7 +6,9 @@ Step-by-step commands and expected outputs for verifying the POC.
 
 - Docker with compose (Docker Desktop, colima, or podman-compose)
 - 4 GB RAM free
-- Ports **1883** (MQTT) and **8081** (EMQX dashboard) free on the host
+- Ports **1883** (MQTT) and **18083** (EMQX dashboard) free on the host.
+  Port **8080** (Device Registry) is also published so the §4 curl checks
+  work from the host.
 - About 5 minutes
 
 ## 1. Boot the stack
@@ -27,25 +29,47 @@ The four services come up in dependency order: `emqx` → `registry` →
 docker compose logs emqx 2>&1 | grep -i plugin
 ```
 
-Expected: lines from EMQX mentioning `emqx_plugin_enrich` during startup, and a
-log line `emqx_plugin_enrich hook_us=...` for the first published message.
+Expected: two startup lines on stdout —
+
+```
+emqx_plugin_enrich: starting
+emqx_plugin_enrich: hook registered
+```
+
+— and, once you publish (step 5), a `hook_us` line per message. `hook_us` is
+logged at **warning** level on purpose, because EMQX's default log level is
+`warning` and this is the demo's key observable:
+
+```
+... [warning] <client>@<ip> emqx_plugin_enrich hook_us=32
+```
 
 If you see nothing, the plugin wasn't loaded. Jump to [§ Troubleshooting](#troubleshooting).
 
-## 3. Verify the hook is registered at highest priority
+## 3. Verify the hook is registered
+
+EMQX 5.8 has no `emqx ctl hooks list` command. Query the hook registry
+through the node instead:
 
 ```bash
-docker compose exec emqx /opt/emqx/bin/emqx ctl hooks list | grep message.publish
+docker compose exec emqx /opt/emqx/bin/emqx eval "emqx_hooks:lookup('message.publish')."
 ```
 
-Expected: a line showing
+Expected: a list of callbacks that includes our plugin at priority `100`:
 
 ```
-'message.publish': [{emqx_plugin_enrich, on_message_publish, []}, 100]
+{callback,{emqx_plugin_enrich,on_message_publish,[]},undefined,100}
 ```
 
-The `100` at the end is the priority. If another hook is at a higher number, it
-runs before ours.
+The `100` is the priority. Note the callback is **arity 1**
+(`on_message_publish/1`): for a `fold` hook EMQX passes the `#message{}`
+record as the single argument.
+
+> Priority note: in EMQX a *higher* integer runs *earlier*. The built-in
+> publish hooks (`emqx_retainer` at 930, `emqx_delayed` at 860, etc.) run
+> before this plugin, so for this POC enrichment happens after them. If you
+> need enrichment to precede retain/delay, raise the priority above those
+> numbers.
 
 ## 4. Verify the registry is up
 
@@ -91,15 +115,16 @@ docker compose logs -f subscriber
 ```
 subscribed to plant/+/telemetry
 [plant/dev-001/telemetry] {"device_id":"dev-001","temp_c":21.5,"ts":...}
-[plant/dev-001/telemetry] {"device_id":"dev-001","temp_c":21.6,"ts":...,"org_id":"GDANSK-11"}
+[plant/dev-001/telemetry] {"ts":...,"temp_c":21.6,"org_id":"GDANSK-11","device_id":"dev-001"}
 [plant/dev-002/telemetry] {"device_id":"dev-002","temp_c":21.7,"ts":...}
 [plant/dev-003/telemetry] {"device_id":"dev-003","temp_c":21.8,"ts":...}
 [plant/dev-999/telemetry] {"device_id":"dev-999","temp_c":21.9,"ts":...}
 ```
 
-The second `dev-001` line carries `"org_id":"GDANSK-11"`. Lines without
-`org_id` are blips (the first message per device, or a device not found in the
-registry).
+The second `dev-001` line carries `"org_id":"GDANSK-11"`. (Key order in the
+enriched line is not significant — JSON re-encoding may reorder keys.) Lines
+without `org_id` are blips (the first message per device, or a device not
+found in the registry).
 
 ## 6. Verify microsecond enrichment
 
@@ -171,7 +196,7 @@ device blip too, but the hook is still microsecond.
 
 ```bash
 docker compose restart emqx
-docker compose logs emqx | grep -i plugin
+docker compose logs emqx | grep -i enrich
 ```
 
 The plugin's cache survives in-process only — restart empties it. So after
@@ -184,7 +209,7 @@ should consider cluster-wide coherence.
 ### "Plugin not loaded"
 
 ```bash
-docker compose exec emqx ls /opt/emqx/plugins/emqx_plugin_enrich/ebin/
+docker compose exec emqx ls /opt/emqx/plugins/emqx_plugin_enrich-0.1.0/emqx_plugin_enrich-0.1.0/ebin/
 ```
 
 Expected: `emqx_plugin_enrich.app` and `emqx_plugin_enrich.beam`. If empty,
@@ -196,11 +221,21 @@ the multi-stage build didn't copy correctly — check `emqx-plugin/Dockerfile`.
 docker compose exec emqx /opt/emqx/bin/emqx ctl plugins list
 ```
 
-Expected: `emqx_plugin_enrich ... running`. If stopped, restart:
+Expected JSON with `"running_status": "running"` and
+`"config_status": "enabled"`. If it says `loaded`/`not_configured`, the plugin
+app was never *started* — EMQX only ran if `plugins.states` in
+`etc/base.hocon` lists it with `enable = true` (the Dockerfile adds this), and
+if the `.app` file has a `{mod, {emqx_plugin_enrich, []}}` entry so OTP calls
+`start/2`. Start it manually with (note the version suffix):
 
 ```bash
-docker compose exec emqx /opt/emqx/bin/emqx ctl plugins enable emqx_plugin_enrich
-docker compose restart emqx
+docker compose exec emqx /opt/emqx/bin/emqx ctl plugins start emqx_plugin_enrich-0.1.0
+```
+
+Expected: `emqx_plugin_enrich-0.1.0 ... running`. If stopped, restart:
+
+```bash
+docker compose exec emqx /opt/emqx/bin/emqx ctl plugins start emqx_plugin_enrich-0.1.0
 ```
 
 ### "Hook latency is milliseconds, not microseconds"

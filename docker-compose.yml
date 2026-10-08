@@ -4,9 +4,9 @@ services:
     container_name: emqx
     ports:
       - "1883:1883"
-      - "8081:8081"
+      - "18083:18083"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fs http://localhost:8081/api/v5/health > /dev/null"]
+      test: ["CMD-SHELL", "curl -fs http://localhost:18083/api/v5/status > /dev/null"]
       interval: 5s
       timeout: 5s
       retries: 20
@@ -39,6 +39,8 @@ services:
     image: python:3-slim
     container_name: registry
     working_dir: /app
+    ports:
+      - "8080:8080"
     volumes:
       - ./registry:/app
     command: ["python", "app.py"]

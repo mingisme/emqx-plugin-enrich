@@ -1,0 +1,6 @@
+{
+  "name": "emqx_plugin_enrich",
+  "rel_vsn": "0.1.0",
+  "description": "In-place enrichment from a sidecar Device Registry.",
+  "rel_apps": ["emqx_plugin_enrich-0.1.0"]
+}

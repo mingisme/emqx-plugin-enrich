@@ -5,9 +5,15 @@ The cache-hit path completes in microseconds; the publish path never blocks.
 
 ## Hypothesis (what this POC validates)
 
-A `message.publish` hook at highest priority on EMQX 5.8.8 can rewrite the payload
+A `message.publish` hook on EMQX 5.8.8 can rewrite the payload
 in place, and the cache-hit enrichment path completes in microseconds — so
 subscribers experience no perceptible overhead.
+
+> The hook is registered at priority `100`. In EMQX a higher integer runs
+> earlier, so `100` is a *low* priority: the built-in publish hooks
+> (`emqx_retainer`, `emqx_delayed`) run before it. Raise the number if
+> enrichment must precede them. The latency claim holds regardless of
+> priority.
 
 The hook itself is measured and logged (`hook_us=N`) on every publish. Look for
 those lines in `docker compose logs emqx`.
@@ -40,7 +46,7 @@ docker compose up --build
 ```
 
 You'll see four services come up:
-- `emqx` (broker, port 1883 for MQTT, 8081 for the dashboard)
+- `emqx` (broker, port 1883 for MQTT, 18083 for the dashboard)
 - `registry` (Python HTTP server, port 8080)
 - `publisher` (one-shot; publishes messages and exits)
 - `subscriber` (long-running; prints whatever it receives)
